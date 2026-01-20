@@ -1,6 +1,4 @@
 import os
-import time
-from threading import Lock
 
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -11,83 +9,6 @@ from checkout import checkout_logic
 app = FastAPI()
 SRN = "PES2UG23CS167"
 templates = Jinja2Templates(directory="templates")
-
-
-# Small in-process cache for read-heavy endpoints like /events.
-# This dramatically improves Locust results when the same page is hit repeatedly.
-_EVENTS_CACHE_TTL_SECONDS = float(os.getenv("EVENTS_CACHE_TTL_SECONDS", "2.0"))
-_events_cache_lock = Lock()
-_events_cache_ts: float = 0.0
-_events_cache_data: list[tuple] | None = None
-
-_MY_EVENTS_CACHE_TTL_SECONDS = float(os.getenv("MY_EVENTS_CACHE_TTL_SECONDS", "0"))
-_my_events_cache_lock = Lock()
-_my_events_cache: dict[str, tuple[float, list[tuple]]] = {}
-
-
-def _get_events_cached(db) -> list[tuple]:
-    global _events_cache_ts, _events_cache_data
-
-    if _EVENTS_CACHE_TTL_SECONDS <= 0:
-        rows = db.execute("SELECT id, name, fee FROM events").fetchall()
-        return [tuple(r) for r in rows]
-
-    now = time.monotonic()
-    with _events_cache_lock:
-        if _events_cache_data is not None and (now - _events_cache_ts) < _EVENTS_CACHE_TTL_SECONDS:
-            return _events_cache_data
-
-    rows = db.execute("SELECT id, name, fee FROM events").fetchall()
-    data = [tuple(r) for r in rows]
-
-    with _events_cache_lock:
-        _events_cache_data = data
-        _events_cache_ts = now
-
-    return data
-
-
-def _get_my_events_cached(db, username: str) -> list[tuple]:
-    if _MY_EVENTS_CACHE_TTL_SECONDS <= 0:
-        rows = db.execute(
-            """
-            SELECT events.name, events.fee
-            FROM events
-            JOIN registrations ON events.id = registrations.event_id
-            WHERE registrations.username=?
-            """,
-            (username,),
-        ).fetchall()
-        return [tuple(r) for r in rows]
-
-    now = time.monotonic()
-    with _my_events_cache_lock:
-        cached = _my_events_cache.get(username)
-        if cached is not None:
-            ts, data = cached
-            if (now - ts) < _MY_EVENTS_CACHE_TTL_SECONDS:
-                return data
-
-    rows = db.execute(
-        """
-        SELECT events.name, events.fee
-        FROM events
-        JOIN registrations ON events.id = registrations.event_id
-        WHERE registrations.username=?
-        """,
-        (username,),
-    ).fetchall()
-    data = [tuple(r) for r in rows]
-
-    with _my_events_cache_lock:
-        _my_events_cache[username] = (now, data)
-
-    return data
-
-
-def _invalidate_my_events_cache(username: str) -> None:
-    with _my_events_cache_lock:
-        _my_events_cache.pop(username, None)
 
 
 @app.on_event("startup")
@@ -155,7 +76,7 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
 def events(request: Request, user: str):
     db = get_db()
     try:
-        rows = _get_events_cached(db)
+        rows = db.execute("SELECT id, name, fee FROM events").fetchall()
     finally:
         db.close()
 
@@ -183,9 +104,6 @@ def register_event(event_id: int, user: str):
     finally:
         db.close()
 
-    # New registration changes the /my-events result for this user.
-    _invalidate_my_events_cache(user)
-
     return RedirectResponse(f"/my-events?user={user}", status_code=302)
 
 
@@ -193,7 +111,15 @@ def register_event(event_id: int, user: str):
 def my_events(request: Request, user: str):
     db = get_db()
     try:
-        rows = _get_my_events_cached(db, user)
+        rows = db.execute(
+            """
+            SELECT events.name, events.fee
+            FROM events
+            JOIN registrations ON events.id = registrations.event_id
+            WHERE registrations.username=?
+            """,
+            (user,)
+        ).fetchall()
     finally:
         db.close()
 
